@@ -26,9 +26,17 @@ export function getVersion(): string {
  */
 export class CloudflareLogger {
   level: string;
+  username?: string | (() => string | undefined);
+  moduleName: string;
 
-  constructor(level: string = 'info') {
+  constructor(
+    level: string = 'info',
+    username?: string | (() => string | undefined),
+    moduleName?: string
+  ) {
     this.level = level.toLowerCase();
+    this.username = username;
+    this.moduleName = moduleName || 'general';
   }
 
   public shouldLog(level: string): boolean {
@@ -38,8 +46,21 @@ export class CloudflareLogger {
     );
   }
 
-  private formatMessage(level: string, message: string, ...args: any[]): string {
-    let formattedMessage = `[v${getVersion()}] ${level.toUpperCase()}: ${message}`;
+  private formatMessage(
+    level: string,
+    message: string,
+    usernameOpt?: string | (() => string | undefined),
+    ...args: any[]
+  ): string {
+    let user = 'system'; // Default username
+    if (usernameOpt) {
+      const actualUsername = typeof usernameOpt === 'function' ? usernameOpt() : usernameOpt;
+      if (actualUsername) {
+        user = actualUsername;
+      }
+    }
+    // The opts.prefix is not used by CloudflareLogger, which is fine. // This comment is no longer accurate
+    let formattedMessage = `${level.toUpperCase()} [v${getVersion()}][${this.moduleName}][${user}]: ${message}`;
 
     if (args.length > 0) {
       const formattedArgs = args
@@ -53,31 +74,31 @@ export class CloudflareLogger {
 
   error(message: string, ...args: any[]): void {
     if (this.shouldLog('error')) {
-      console.error(this.formatMessage('error', message, ...args));
+      console.error(this.formatMessage('error', message, this.username, ...args));
     }
   }
 
   warn(message: string, ...args: any[]): void {
     if (this.shouldLog('warn')) {
-      console.warn(this.formatMessage('warn', message, ...args));
+      console.warn(this.formatMessage('warn', message, this.username, ...args));
     }
   }
 
   info(message: string, ...args: any[]): void {
     if (this.shouldLog('info')) {
-      console.log(this.formatMessage('info', message, ...args));
+      console.log(this.formatMessage('info', message, this.username, ...args));
     }
   }
 
   debug(message: string, ...args: any[]): void {
     if (this.shouldLog('debug')) {
-      console.log(this.formatMessage('debug', message, ...args));
+      console.log(this.formatMessage('debug', message, this.username, ...args));
     }
   }
 
   silly(message: string, ...args: any[]): void {
     if (this.shouldLog('silly')) {
-      console.log(this.formatMessage('silly', message, ...args));
+      console.log(this.formatMessage('silly', message, this.username, ...args));
     }
   }
 }
@@ -338,21 +359,26 @@ export function createLogger(options?: {
   isCloudflare?: boolean;
   isClient?: boolean;
   level?: string;
+  username?: string | (() => string | undefined);
 }) {
   // Default options
   const opts = {
-    prefix: '',
+    prefix: 'general', // Default module name
     enableSummary: true,
     isCloudflare: process.env.CLOUDFLARE === 'true',
     isClient: typeof window !== 'undefined',
+    username: undefined,
     ...options,
   };
 
-  // Check for Cloudflare Worker environment directly
-  const isCloudflareWorker = typeof globalThis.caches !== 'undefined';
-  if (isCloudflareWorker) {
+  // Override for Cloudflare Worker (globalThis.caches)
+  const isCloudflareWorkerViaCaches = typeof globalThis.caches !== 'undefined';
+  if (isCloudflareWorkerViaCaches) {
     opts.isCloudflare = true;
-    // Disable summary logging in Cloudflare Workers to avoid setInterval
+  }
+
+  // If opts.isCloudflare is true for any reason, disable summary.
+  if (opts.isCloudflare) {
     opts.enableSummary = false;
   }
 
@@ -371,33 +397,42 @@ export function createLogger(options?: {
 
   // Use simple logger for Cloudflare environment
   if (opts.isCloudflare) {
-    baseLogger = new CloudflareLogger(logLevel);
+    baseLogger = new CloudflareLogger(logLevel, opts.username, opts.prefix);
   } else {
     // Use Winston for all other environments
     if (!winston) {
       // eslint-disable-next-line @typescript-eslint/no-var-requires
       winston = require('winston');
     }
-    const prefix = opts.prefix ? `[${opts.prefix}] ` : '';
 
     baseLogger = winston!.createLogger({
       level: logLevel,
       format: winston!.format.combine(
         winston!.format.colorize(),
         winston!.format.printf(info => {
-          // Handle multiple arguments passed to the logger
           const splat = info[Symbol.for('splat')] || [];
-          let message = prefix + info.message;
-
-          // If there are additional arguments, format them and add to the message
+          let msg = info.message;
           if (splat && Array.isArray(splat) && splat.length > 0) {
             const args = splat
               .map((arg: any) => (typeof arg === 'object' ? JSON.stringify(arg) : arg))
               .join(' ');
-            message = `${message} ${args}`;
+            msg = `${msg} ${args}`;
           }
 
-          return `[v${getVersion()}] ${info.level}: ${message}`;
+          let user = 'system'; // Default username
+          if (opts.username) {
+            const actualUsername =
+              typeof opts.username === 'function' ? opts.username() : opts.username;
+            if (actualUsername) {
+              user = actualUsername;
+            }
+          }
+          const moduleName = opts.prefix || 'general'; // Use opts.prefix as module, default to 'general'
+
+          // Strip color codes from info.level before converting to uppercase for consistent format
+          const level = info.level.replace(/\[[0-9;]*m/g, '').toUpperCase();
+
+          return `${level} [v${getVersion()}][${moduleName}][${user}]: ${msg}`;
         })
       ),
       transports: [new winston!.transports.Console()],

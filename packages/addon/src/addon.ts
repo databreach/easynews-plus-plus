@@ -15,18 +15,19 @@ import {
   matchesTitle,
   getAlternativeTitles,
   isAuthError,
+  setUtilsUsername,
 } from './utils';
 import { EasynewsAPI, SearchOptions, EasynewsSearchResponse } from 'easynews-plus-plus-api';
 import { publicMetaProvider } from './meta';
 import { Stream } from './types';
 import customTitlesJson from '../../../custom-titles.json';
 import { getUILanguage, translations } from './i18n';
-import { createLogger } from 'easynews-plus-plus-shared';
+import { createLogger, Logger } from 'easynews-plus-plus-shared';
 
 // Extended configuration interface
 interface AddonConfig {
   username: string;
-  password: string;
+  password?: string;
   strictTitleMatching?: string;
   preferredLanguage?: string;
   sortingPreference?: string;
@@ -37,20 +38,46 @@ interface AddonConfig {
   [key: string]: any;
 }
 
-// Create a logger with Addon prefix and explicitly set the level from environment variable
-export const logger = createLogger({
-  prefix: 'Addon',
-  level: process.env.EASYNEWS_LOG_LEVEL || undefined, // Use the environment variable if set
+let currentUsername: string | undefined = undefined;
+
+export const logger: Logger = createLogger({
+  prefix: 'Addon', // This will be used as the module name
+  level: process.env.EASYNEWS_LOG_LEVEL || undefined,
+  username: () => currentUsername,
 });
 
 // Helper to create a localized auth error stream
 function authErrorStream(langCode: string) {
   const lang = getUILanguage(langCode);
+  let description =
+    'Authentication Failed: Please check credentials and reconfigure addon. (Default)'; // Default fallback
+
+  if (translations[lang] && translations[lang].errors && translations[lang].errors.authFailed) {
+    description = translations[lang].errors.authFailed;
+  } else if (
+    translations['en'] &&
+    translations['en'].errors &&
+    translations['en'].errors.authFailed
+  ) {
+    // Fallback to English if preferred lang failed
+    description = translations['en'].errors.authFailed;
+    // Ensure logger is defined or imported if not already in scope, assuming it is:
+    logger.warn(
+      `Translation not found for lang '${lang}' or it was incomplete. Fell back to English for auth error.`
+    );
+  } else {
+    // This case should ideally not be reached if 'en' is always present and complete
+    // Ensure logger is defined or imported if not already in scope, assuming it is:
+    logger.error(
+      `Critical: English translation for authFailed is missing. Using hardcoded default.`
+    );
+  }
+
   return {
     streams: [
       {
         name: 'Easynews++ Auth Error',
-        description: translations[lang].errors.authFailed,
+        description: description,
         url: 'https://example.com/error', // Dummy URL that won't play
         behaviorHints: {
           notWebReady: true,
@@ -132,54 +159,79 @@ export const landingHTML = customTemplate(manifest);
 
 builder.defineStreamHandler(
   async ({ id, type, config }: { id: string; type: ContentType; config: AddonConfig }) => {
-    // Apply default values for any missing configuration options
-    const {
-      username,
-      password,
-      strictTitleMatching = DEFAULT_CONFIG.strictTitleMatching,
-      preferredLanguage = DEFAULT_CONFIG.preferredLanguage,
-      sortingPreference = DEFAULT_CONFIG.sortingPreference,
-      showQualities = DEFAULT_CONFIG.showQualities,
-      maxResultsPerQuality = DEFAULT_CONFIG.maxResultsPerQuality,
-      maxFileSize = DEFAULT_CONFIG.maxFileSize,
-      baseUrl,
-      ...options
-    } = config;
-
-    if (!id.startsWith('tt')) {
-      return {
-        streams: [],
-      };
+    // Check for essential config early
+    if (!config || !config.username || !config.password) {
+      logger.warn(
+        'User configuration is incomplete. Username or password missing. Cannot process request.'
+      );
+      // Return an auth error stream or empty if preferredLanguage is not available
+      return authErrorStream(config?.preferredLanguage || '');
     }
-
-    // Include settings in cache key to ensure
-    // users with different settings get different cache results
-    const cacheKey = `${id}:v3:user=${username}:strict=${strictTitleMatching === 'on' || strictTitleMatching === 'true'}:lang=${preferredLanguage || ''}:sort=${sortingPreference}:qualities=${showQualities || ''}:maxPerQuality=${maxResultsPerQuality || ''}:maxSize=${maxFileSize || ''}`;
-
-    logger.debug(`Cache key: ${cacheKey}`);
-    const cached = getFromCache<{ streams: Stream[] }>(cacheKey);
-
-    if (cached) {
-      return cached;
-    }
+    currentUsername = config.username;
+    setUtilsUsername(currentUsername);
+    logger.debug(`Stream handler invoked for id: ${id}, type: ${type}`);
 
     try {
+      // Apply default values for any missing configuration options
+      const {
+        username,
+        password,
+        strictTitleMatching = DEFAULT_CONFIG.strictTitleMatching,
+        preferredLanguage = DEFAULT_CONFIG.preferredLanguage,
+        sortingPreference = DEFAULT_CONFIG.sortingPreference,
+        showQualities = DEFAULT_CONFIG.showQualities,
+        maxResultsPerQuality = DEFAULT_CONFIG.maxResultsPerQuality,
+        maxFileSize = DEFAULT_CONFIG.maxFileSize,
+        baseUrl,
+        ...options
+      } = config;
+
+      if (!id.startsWith('tt')) {
+        return {
+          streams: [],
+        };
+      }
+
+      // Include settings in cache key to ensure
+      // users with different settings get different cache results
+      const cacheKey = `${id}:v3:user=${username}:strict=${strictTitleMatching === 'on' || strictTitleMatching === 'true'}:lang=${preferredLanguage || ''}:sort=${sortingPreference}:qualities=${showQualities || ''}:maxPerQuality=${maxResultsPerQuality || ''}:maxSize=${maxFileSize || ''}`;
+
+      logger.debug(`Cache key: ${cacheKey}`);
+      const cached = getFromCache<{ streams: Stream[] }>(cacheKey);
+
+      if (cached) {
+        logger.debug(`Cache hit for key: ${cacheKey}. Returning cached streams.`);
+        return cached;
+      }
+      logger.debug(`Cache miss for key: ${cacheKey}. Proceeding to fetch streams.`);
+
+      const useStrictMatching = strictTitleMatching === 'on' || strictTitleMatching === 'true';
+      const preferredLang = preferredLanguage || '';
+
+      // Log the fully resolved config, be mindful of sensitive data if any in future
+      // For now, username/password are not logged here but are available via currentUsername for the logger prefix
+      const resolvedConfigForLogging = { ...config };
+      delete resolvedConfigForLogging.password; // Explicitly remove password from this log
+      logger.debug(
+        `Resolved config for user: ${username}, strict: ${useStrictMatching}, lang: ${preferredLang}, qualities: ${showQualities}, sort: ${sortingPreference}`
+      );
+
       if (!username || !password) {
-        // Instead of throwing error, return a single stream with error message
+        // This check is theoretically redundant due to the one at the start of the handler,
+        // but kept for safety in case of unexpected config state changes.
+        logger.warn('Username or password became undefined during handler execution.');
         return authErrorStream(config.preferredLanguage || '');
       }
 
-      const useStrictMatching = strictTitleMatching === 'on' || strictTitleMatching === 'true';
       if (!config.strictTitleMatching) {
-        logger.info(`Using default strictTitleMatching: ${strictTitleMatching}`);
+        logger.debug(`Using default strictTitleMatching: ${strictTitleMatching}`);
       } else {
         // Parse strictTitleMatching option (checkbox returns string 'on' or undefined)
         logger.info(`Strict title matching: ${useStrictMatching ? 'enabled' : 'disabled'}`);
       }
 
-      const preferredLang = preferredLanguage || '';
       if (!config.preferredLanguage) {
-        logger.info(`Using default preferredLanguage: ${preferredLanguage || 'No preference'}`);
+        logger.debug(`Using default preferredLanguage: ${preferredLanguage || 'No preference'}`);
       } else {
         // Get preferred language from configuration
         logger.info(
@@ -196,7 +248,7 @@ builder.defineStreamHandler(
         : ['4k', '1080p', '720p', '480p'];
 
       if (!config.showQualities) {
-        logger.info('Using default showQualities: ' + showQualities);
+        logger.debug('Using default showQualities: ' + showQualities);
       } else {
         logger.info(`Quality filters: ${qualityFilters.join(', ')}`);
       }
@@ -207,7 +259,7 @@ builder.defineStreamHandler(
         maxResultsPerQualityValue = 0;
       }
       if (!config.maxResultsPerQuality) {
-        logger.info('Using default maxResultsPerQuality: ' + maxResultsPerQuality);
+        logger.debug('Using default maxResultsPerQuality: ' + maxResultsPerQuality);
       } else {
         logger.info(
           `Max results per quality: ${maxResultsPerQualityValue === 0 ? 'No limit' : maxResultsPerQualityValue}`
@@ -220,7 +272,7 @@ builder.defineStreamHandler(
         maxFileSizeGB = 0;
       }
       if (!config.maxFileSize) {
-        logger.info('Using default maxFileSize: ' + maxFileSize);
+        logger.debug('Using default maxFileSize: ' + maxFileSize);
       } else {
         logger.info(`Max file size: ${maxFileSizeGB === 0 ? 'No limit' : maxFileSizeGB + ' GB'}`);
       }
@@ -233,7 +285,7 @@ builder.defineStreamHandler(
       );
 
       if (!config.sortingPreference) {
-        logger.info(`Using default sortingPreference: ${sortingPreference}`);
+        logger.debug(`Using default sortingPreference: ${sortingPreference}`);
       } else {
         logger.info(`Sorting preference from config: ${sortingPreference}`);
       }
@@ -262,15 +314,20 @@ builder.defineStreamHandler(
       );
 
       const meta = await publicMetaProvider(id, type, preferredLanguage);
+
+      // Original logger.debug call:
+      logger.debug(
+        `Fetched metadata for "${meta.name}" (Year: ${meta.year}, Type: ${meta.type}${type === 'series' && meta.season && meta.episode ? `, S${meta.season}E${meta.episode}` : ''})`
+      );
       logger.info(`Searching for: ${meta.name}`);
 
       // Check if we have a custom title for this title directly
       if (customTitles[meta.name]) {
-        logger.info(
+        logger.debug(
           `Direct custom title found for "${meta.name}": "${customTitles[meta.name].join('", "')}"`
         );
       } else {
-        logger.info(`No direct custom title found for "${meta.name}", checking partial matches`);
+        logger.debug(`No direct custom title found for "${meta.name}", checking partial matches`);
 
         // Look for partial matches in title keys
         for (const [key, values] of Object.entries(customTitles)) {
@@ -298,6 +355,9 @@ builder.defineStreamHandler(
 
       // Initialize with the original title
       let allTitles = [meta.name];
+      logger.debug(
+        `Initial allTitles count: ${allTitles.length}, first: ${allTitles.length > 0 ? allTitles[0] : 'N/A'}`
+      );
 
       // Add any direct custom titles found in customTitles
       if (customTitles[meta.name] && customTitles[meta.name].length > 0) {
@@ -305,6 +365,9 @@ builder.defineStreamHandler(
           `Adding direct custom titles for "${meta.name}": "${customTitles[meta.name].join('", "')}"`
         );
         allTitles = [...allTitles, ...customTitles[meta.name]];
+        logger.debug(
+          `allTitles after direct custom count: ${allTitles.length}, first: ${allTitles.length > 0 ? allTitles[0] : 'N/A'}`
+        );
       }
 
       // Add any alternative names from meta (if available)
@@ -315,6 +378,9 @@ builder.defineStreamHandler(
         // Filter out duplicates
         const newAlternatives = meta.alternativeNames.filter(alt => !allTitles.includes(alt));
         allTitles = [...allTitles, ...newAlternatives];
+        logger.debug(
+          `allTitles after meta alternatives count: ${allTitles.length}, first: ${allTitles.length > 0 ? allTitles[0] : 'N/A'}`
+        );
       }
 
       // Use getAlternativeTitles to find additional matches (like partial matches)
@@ -325,9 +391,16 @@ builder.defineStreamHandler(
       if (additionalTitles.length > 0) {
         logger.debug(`Adding ${additionalTitles.length} additional titles from partial matches`);
         allTitles = [...allTitles, ...additionalTitles];
+        logger.debug(
+          `allTitles after partial matches count: ${allTitles.length}, first: ${allTitles.length > 0 ? allTitles[0] : 'N/A'}`
+        );
       }
 
-      logger.debug(`Will search for ${allTitles.length} titles: ${allTitles.join(', ')}`);
+      // Remove duplicates again just in case, and ensure original meta.name is first
+      allTitles = [meta.name, ...new Set(allTitles.filter(t => t !== meta.name))];
+      logger.info(
+        `Final list of titles to search for (${allTitles.length}): ${allTitles.join('; ')}`
+      );
 
       // Store all search results here
       const allSearchResults: {
@@ -366,7 +439,9 @@ builder.defineStreamHandler(
 
         const titleMeta = { ...meta, name: titleVariant, year: undefined };
         const query = buildSearchQuery(type, titleMeta);
-        logger.debug(`Searching without year for: "${query}"`);
+        logger.debug(
+          `Preparing search for query: "${query}", SortOptions: ${JSON.stringify(sortOptions)}`
+        );
 
         try {
           const res = await api.search({
@@ -383,10 +458,12 @@ builder.defineStreamHandler(
             logger.debug(`Total unique results so far: ${totalFoundResults}`);
 
             // Log a few examples of the results
-            const examples = res.data.slice(0, 2);
-            for (const file of examples) {
-              const title = getPostTitle(file);
-              logger.debug(`Example result: "${title}" (${file['4'] || 'unknown size'})`);
+            if (res.data && res.data.length > 0) {
+              const firstFile = res.data[0];
+              const firstTitle = getPostTitle(firstFile);
+              logger.debug(
+                `First example result for query "${query}": "${firstTitle}" (Size: ${firstFile['4'] || 'N/A'}, Hash: ${firstFile['0'] || 'N/A'})`
+              );
             }
           }
         } catch (error) {
@@ -430,7 +507,9 @@ builder.defineStreamHandler(
 
             const titleMeta = { ...meta, name: titleVariant, year: meta.year };
             const query = buildSearchQuery(type, titleMeta);
-            logger.debug(`Searching with year for: "${query}"`);
+            logger.debug(
+              `Preparing search with year for query: "${query}", SortOptions: ${JSON.stringify(sortOptions)}`
+            );
 
             try {
               const res = await api.search({
@@ -447,10 +526,12 @@ builder.defineStreamHandler(
                 logger.debug(`Total unique results so far: ${totalFoundResults}`);
 
                 // Log a few examples of the results
-                const examples = res.data.slice(0, 2);
-                for (const file of examples) {
-                  const title = getPostTitle(file);
-                  logger.debug(`Example result: "${title}" (${file['4'] || 'unknown size'})`);
+                if (res.data && res.data.length > 0) {
+                  const firstFile = res.data[0];
+                  const firstTitle = getPostTitle(firstFile);
+                  logger.debug(
+                    `First example result for query "${query}": "${firstTitle}" (Size: ${firstFile['4'] || 'N/A'}, Hash: ${firstFile['0'] || 'N/A'})`
+                  );
                 }
               }
             } catch (error) {
@@ -497,7 +578,12 @@ builder.defineStreamHandler(
           const title = getPostTitle(file);
           const fileHash = file['0']; // Use file hash to detect duplicates
 
-          if (isBadVideo(file) || processedHashes.has(fileHash)) {
+          if (isBadVideo(file)) {
+            logger.debug(`Rejected stream (bad video): "${title}", File hash: ${file['0']}`);
+            continue;
+          }
+          if (processedHashes.has(fileHash)) {
+            logger.debug(`Rejected stream (duplicate hash): "${title}", Hash: ${fileHash}`);
             continue;
           }
 
@@ -826,6 +912,9 @@ builder.defineStreamHandler(
         );
 
         if (isCustomQualityFilter) {
+          logger.debug(
+            `Applying custom quality filtering. Initial stream count: ${streams.length}. Filters: ${qualityFilters.join(', ')}`
+          );
           const qualityMap: Record<string, string[]> = {
             '4k': ['4K', 'UHD', '2160p'],
             '1080p': ['1080p'],
@@ -845,6 +934,7 @@ builder.defineStreamHandler(
           logger.debug(`Accepted quality terms: ${allowedQualityTerms.join(', ')}`);
 
           if (allowedQualityTerms.length > 0) {
+            const streamsBeforeQualityFilter = streams.length;
             const filteredStreams = streams.filter(stream => {
               const quality = stream.name?.split('\n')[1] || '';
               const matchesQuality = allowedQualityTerms.some(term => quality.includes(term));
@@ -854,15 +944,23 @@ builder.defineStreamHandler(
             // Only update if we found at least one match
             if (filteredStreams.length > 0) {
               streams = filteredStreams;
-              logger.debug(`After quality filtering: ${streams.length} streams remain`);
+              logger.debug(
+                `After quality filtering: ${streams.length} streams remain (was ${streamsBeforeQualityFilter})`
+              );
             } else {
-              logger.warn(`Quality filtering would remove all streams - keeping original results`);
+              logger.warn(
+                `Quality filtering (terms: ${allowedQualityTerms.join(', ')}) would remove all ${streamsBeforeQualityFilter} streams - keeping original results`
+              );
             }
           }
         }
 
         // Filter streams by file size (only if maxFileSizeGB > 0)
         if (maxFileSizeGB > 0) {
+          logger.debug(
+            `Applying max file size filtering. Limit: ${maxFileSizeGB}GB. Initial stream count: ${streams.length}`
+          );
+          const streamsBeforeSizeFilter = streams.length;
           const filteredStreams = streams.filter(stream => {
             const description = stream.description || '';
             const sizeLine = description.split('\n').find(line => line.includes('📦'));
@@ -888,14 +986,21 @@ builder.defineStreamHandler(
           // Only update if we found at least one match
           if (filteredStreams.length > 0) {
             streams = filteredStreams;
-            logger.debug(`After max file size filtering: ${streams.length} streams remain`);
+            logger.debug(
+              `After max file size filtering: ${streams.length} streams remain (was ${streamsBeforeSizeFilter})`
+            );
           } else {
-            logger.warn(`File size filtering would remove all streams - keeping original results`);
+            logger.warn(
+              `Max file size filtering (${maxFileSizeGB}GB) would remove all ${streamsBeforeSizeFilter} streams - keeping original results`
+            );
           }
         }
 
         // Group streams by quality for limiting per quality (only if maxResultsPerQualityValue > 0)
         if (maxResultsPerQualityValue > 0) {
+          logger.debug(
+            `Applying max results per quality. Limit: ${maxResultsPerQualityValue}. Initial stream count: ${streams.length}`
+          );
           const streamsByQuality: Record<string, Stream[]> = {};
 
           // Determine quality category for each stream
@@ -920,12 +1025,15 @@ builder.defineStreamHandler(
           });
 
           // Log the distribution of streams by quality
-          Object.entries(streamsByQuality).forEach(([quality, streams]) => {
-            logger.debug(`Quality ${quality}: ${streams.length} streams`);
+          Object.entries(streamsByQuality).forEach(([quality, qualityStreamList]) => {
+            logger.debug(
+              `Pre-limit count for quality ${quality}: ${qualityStreamList.length} streams`
+            );
           });
 
           // Apply limits per quality category and rebuild streams array
           const limitedStreams: Stream[] = [];
+          const streamsBeforePerQualityLimit = streams.length;
           Object.keys(streamsByQuality).forEach(quality => {
             const qualityStreams = streamsByQuality[quality];
             const limitedQualityStreams = qualityStreams.slice(0, maxResultsPerQualityValue);
@@ -941,15 +1049,21 @@ builder.defineStreamHandler(
           if (limitedStreams.length > 0) {
             streams = limitedStreams;
             logger.debug(
-              `After applying max results per quality: ${streams.length} streams remain`
+              `After applying max results per quality: ${streams.length} streams remain (was ${streamsBeforePerQualityLimit})`
             );
           } else {
-            logger.warn(`Per-quality limiting would remove all streams - keeping original results`);
+            logger.warn(
+              `Per-quality limiting (limit: ${maxResultsPerQualityValue}) would remove all ${streamsBeforePerQualityLimit} streams - keeping original results`
+            );
           }
         }
 
         logger.info(`Filtering complete: ${originalCount} streams → ${streams.length} streams`);
       }
+      const streamCountBeforeSort = streams.length;
+      logger.debug(
+        `Preparing to sort ${streamCountBeforeSort} streams. Preference: ${sortingPreference}, Language: ${preferredLang || 'none'}`
+      );
 
       // Now sort the filtered streams based on user preference
       if (sortingPreference === 'language_first' && preferredLang) {
@@ -1186,6 +1300,9 @@ builder.defineStreamHandler(
           }
         });
       }
+      logger.debug(
+        `Sorting complete. Stream count: ${streams.length} (was ${streamCountBeforeSort})`
+      );
 
       if (streams.length > 0) {
         const qualitySummary: Record<string, number> = {};
@@ -1218,6 +1335,9 @@ builder.defineStreamHandler(
       if (isAuthError(error)) return authErrorStream(config.preferredLanguage || '');
 
       return { streams: [] };
+    } finally {
+      currentUsername = undefined; // Reset username at the end of the handler
+      setUtilsUsername(undefined); // Reset utils username
     }
   }
 );

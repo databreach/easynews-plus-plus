@@ -41,39 +41,62 @@ function createManifestWithLanguage(lang: string) {
 
 // Add resolve endpoint for stream requests
 app.get('/resolve/:payload/:filename', async c => {
-  // Expect a Base64URL-encoded URL in the payload
   const encodedUrl = c.req.param('payload');
-  if (!encodedUrl) {
-    return c.text('Missing url parameter', 400);
-  }
-
-  let targetUrl: string;
-  try {
-    // Decode the Base64URL payload back into the Easynews URL with credentials as query-params
-    targetUrl = Buffer.from(encodedUrl, 'base64url').toString('utf-8');
-  } catch {
-    return c.text('Invalid url encoding', 400);
-  }
-
-  // Only accept hosts under easynews.com
-  const parsed = new URL(targetUrl);
-  const host = parsed.hostname.toLowerCase();
-  const allowedDomain = /^([a-z0-9-]+\.)*easynews\.com$/i;
-  if (!allowedDomain.test(host)) {
-    return c.text('Domain not allowed', 403);
-  }
-
-  // Extract and remove credentials
-  const username = parsed.searchParams.get('u') || '';
-  const password = parsed.searchParams.get('p') || '';
-  parsed.searchParams.delete('u');
-  parsed.searchParams.delete('p');
-  const cleanUrl = parsed.toString();
+  const filename = c.req.param('filename');
+  let username: string | null = null; // To be extracted after URL parsing
+  let targetUrl: string = ''; // For logging in broader scope if cleanUrl fails
+  let cleanUrl: string = ''; // For logging in broader scope
 
   try {
+    if (!encodedUrl) {
+      logger.warn(`Missing URL payload in /resolve request for file: ${filename}`); // Global logger
+      return c.text('Missing url parameter', 400);
+    }
+
+    try {
+      // Decode the Base64URL payload back into the Easynews URL with credentials as query-params
+      targetUrl = Buffer.from(encodedUrl, 'base64url').toString('utf-8');
+    } catch (decodeError) {
+      logger.warn(
+        `Invalid URL encoding in /resolve request for file: ${filename}. Payload: ${encodedUrl}`,
+        decodeError
+      ); // Global logger
+      return c.text('Invalid url encoding', 400);
+    }
+
+    // Only accept hosts under easynews.com
+    const parsed = new URL(targetUrl);
+    username = parsed.searchParams.get('u'); // Extract username for logging
+
+    const requestLogger = createLogger({
+      prefix: 'CF', // Module name
+      isCloudflare: true,
+      level: process.env.EASYNEWS_LOG_LEVEL || undefined,
+      username: username || 'cf_unknown_user',
+    });
+
+    requestLogger.info(`Handling /resolve for file: ${filename}`);
+    requestLogger.debug(`Payload for ${filename}: ${encodedUrl}`);
+    requestLogger.debug(`Decoded target URL: ${targetUrl}`);
+
+    const host = parsed.hostname.toLowerCase();
+    const allowedDomain = /^([a-z0-9-]+\.)*easynews\.com$/i;
+    if (!allowedDomain.test(host)) {
+      requestLogger.warn(`Denied /resolve for invalid domain: ${host}. Target: ${targetUrl}`);
+      return c.text('Domain not allowed', 403);
+    }
+
+    // Extract and remove credentials
+    const password = parsed.searchParams.get('p') || ''; // Actual username is in the 'username' variable
+    parsed.searchParams.delete('u');
+    parsed.searchParams.delete('p');
+    cleanUrl = parsed.toString();
+    requestLogger.debug(`Cleaned URL for upstream: ${cleanUrl}`);
+
     // Create authorization header
-    const auth = 'Basic ' + btoa(`${username}:${password}`);
+    const auth = 'Basic ' + btoa(`${username || ''}:${password}`);
 
+    requestLogger.info(`Making upstream GET to: ${cleanUrl}`);
     // Single GET with Range header to follow redirects and only download 1 byte
     const response = await fetch(cleanUrl, {
       method: 'GET',
@@ -81,23 +104,38 @@ app.get('/resolve/:payload/:filename', async c => {
         Authorization: auth,
         Range: 'bytes=0-0',
       },
-      redirect: 'manual',
+      redirect: 'manual', // Important: we handle redirects to get the final URL
     });
 
     // If we got a 3xx (redirect), grab the Location header; otherwise fall back
     const location = response.headers.get('Location') || cleanUrl;
+    requestLogger.info(`Successfully redirecting client for ${cleanUrl} to final: ${location}`);
 
     // Redirect to the final URL
     return c.redirect(location, 307);
   } catch (err) {
-    logger.error(`Error resolving stream ${cleanUrl}:`, err);
+    const logUrl = cleanUrl || targetUrl; // Prefer cleanUrl if available
+    // Use requestLogger if available, or create a new one for the catch block if username was determined
+    const loggerForError =
+      username !== null
+        ? createLogger({
+            // Check if username was set (even if empty string)
+            prefix: 'CF',
+            isCloudflare: true,
+            level: process.env.EASYNEWS_LOG_LEVEL || undefined,
+            username: username || 'cf_catch_unknown',
+          })
+        : logger; // Fallback to global logger if username is still null (very early error)
+    loggerForError.error(`Error resolving stream ${logUrl}: ${(err as Error).message}`, err);
     return c.text('Error resolving stream', 502);
   }
 });
 
 // Add the configure route for direct access with language selection
 app.get('/configure', c => {
-  logger.debug(`Received configure request from: ${c.req.header('user-agent')}`);
+  logger.debug(
+    `Received /configure request. RayID: ${c.req.header('cf-ray')}, User-Agent: ${c.req.header('user-agent')}`
+  );
 
   // Set no-cache headers
   c.header('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
@@ -135,7 +173,9 @@ app.get('/configure', c => {
 if ((addonInterface.manifest.config || []).length > 0) {
   logger.debug('Addon has configuration, setting up root redirect');
   app.get('/', c => {
-    logger.debug(`Received root request from: ${c.req.header('user-agent')}`);
+    logger.debug(
+      `Received / request. RayID: ${c.req.header('cf-ray')}, User-Agent: ${c.req.header('user-agent')}`
+    );
 
     // Pass any language parameter to the configure route
     const lang = c.req.query('lang') || '';

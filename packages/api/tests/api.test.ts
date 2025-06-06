@@ -7,29 +7,67 @@ vi.mock('node:fetch', () => ({
 }));
 
 // Mock the shared package logger
-vi.mock('easynews-plus-plus-shared', () => ({
-  createLogger: () => ({
-    debug: vi.fn(),
-    info: vi.fn(),
-    error: vi.fn(),
-  }),
-}));
+const mockLoggerInstance = {
+  debug: vi.fn(),
+  info: vi.fn(),
+  warn: vi.fn(),
+  error: vi.fn(),
+};
+
+vi.mock('easynews-plus-plus-shared', () => {
+  // This factory is hoisted.
+  // It returns an object where createLogger is a new spy.
+  return {
+    createLogger: vi.fn(() => {
+      // Reset spies on the shared instance for "freshness"
+      // Using mockReset to clear calls, instances, and mock implementation.
+      mockLoggerInstance.debug.mockReset();
+      mockLoggerInstance.info.mockReset();
+      mockLoggerInstance.warn.mockReset();
+      mockLoggerInstance.error.mockReset();
+      return mockLoggerInstance;
+    }),
+    // If other named exports from 'easynews-plus-plus-shared' were used by api.ts,
+    // they would need to be mocked here as well. For example:
+    // anotherExport: vi.fn(),
+  };
+});
 
 describe('EasynewsAPI', () => {
   let api: EasynewsAPI;
+  let importedMockCreateLogger: ReturnType<typeof vi.fn>; // To store the imported mock
 
-  beforeEach(() => {
-    // Create a new API instance for each test
+  beforeEach(async () => {
+    // beforeEach needs to be async for await import
+    // It's important to reset all mocks BEFORE doing anything else,
+    // especially before any code that might use the mocked modules is run.
+    vi.resetAllMocks();
+
+    // Dynamically import the mocked createLogger HERE, after resetAllMocks
+    // and after vi.mock has definitely run.
+    // The createLogger function we get here IS the vi.fn() from the mock factory.
+    const shared = await import('easynews-plus-plus-shared');
+    importedMockCreateLogger = shared.createLogger;
+
+    // Create a new API instance for each test.
+    // This will call the (mocked) createLogger.
     api = new EasynewsAPI({
       username: 'test-user',
       password: 'test-password',
     });
 
-    // Reset fetch mock before each test
-    vi.resetAllMocks();
+    // Assertions on the imported mock
+    expect(importedMockCreateLogger).toHaveBeenCalledWith(
+      expect.objectContaining({
+        prefix: 'API',
+        username: 'test-user',
+      })
+    );
   });
 
   afterEach(() => {
+    // vi.resetAllMocks() in beforeEach should cover this.
+    // If specific clear down is needed beyond resetting call history etc. it can be done here.
     vi.clearAllMocks();
   });
 
@@ -51,6 +89,9 @@ describe('EasynewsAPI', () => {
     });
 
     await expect(api.search({ query: 'test' })).rejects.toThrow('Authentication failed');
+    expect(mockLoggerInstance.warn).toHaveBeenCalledWith(
+      expect.stringContaining('Authentication failed for user: test-user')
+    );
   });
 
   it('should handle API error', async () => {
@@ -62,6 +103,11 @@ describe('EasynewsAPI', () => {
     });
 
     await expect(api.search({ query: 'test' })).rejects.toThrow('Failed to fetch search results');
+    expect(mockLoggerInstance.warn).toHaveBeenCalledWith(
+      expect.stringContaining(
+        'Request failed with status: 500 Internal Server Error for query: "test"'
+      )
+    );
   });
 
   it('should handle network timeout', async () => {
@@ -73,6 +119,9 @@ describe('EasynewsAPI', () => {
     });
 
     await expect(api.search({ query: 'test' })).rejects.toThrow('timed out');
+    expect(mockLoggerInstance.warn).toHaveBeenCalledWith(
+      expect.stringContaining('Search request timed out for: "test"')
+    );
   });
 
   it('should return search results successfully', async () => {
@@ -93,6 +142,12 @@ describe('EasynewsAPI', () => {
     const result = await api.search({ query: 'test' });
     expect(result).toEqual(mockResponse);
     expect(global.fetch).toHaveBeenCalledTimes(1);
+    expect(mockLoggerInstance.debug).toHaveBeenCalledWith(
+      expect.stringContaining('Received 0 results out of 0 total for query: "test"')
+    );
+    expect(mockLoggerInstance.debug).toHaveBeenCalledWith(
+      expect.stringContaining('Caching 0 results for key:')
+    );
   });
 
   it('should use cache for identical searches', async () => {
@@ -116,6 +171,9 @@ describe('EasynewsAPI', () => {
     await api.search({ query: 'test' });
 
     expect(global.fetch).toHaveBeenCalledTimes(1);
+    expect(mockLoggerInstance.debug).toHaveBeenCalledWith(
+      expect.stringContaining('Cache hit for key:')
+    );
   });
 
   it('should call search at least once for searchAll', async () => {

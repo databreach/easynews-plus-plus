@@ -43,10 +43,16 @@ if (typeof process !== 'undefined' && !process.env.CLOUDFLARE) {
   loadEnv();
 }
 
-// Create a logger with Addon prefix and explicitly set the level from environment variable
+let currentUtilsUsername: string | undefined = undefined;
+
+export function setUtilsUsername(username: string | undefined): void {
+  currentUtilsUsername = username;
+}
+
 export const logger = createLogger({
-  prefix: 'Utils',
-  level: process.env.EASYNEWS_LOG_LEVEL || undefined, // Use the environment variable if set
+  prefix: 'Utils', // Module name
+  level: process.env.EASYNEWS_LOG_LEVEL || undefined,
+  username: () => currentUtilsUsername, // Use a function that returns the current username
 });
 
 // Add interface to declare the function with properties
@@ -565,8 +571,10 @@ function getTimestamp(): string {
 }
 
 // These methods should remain at the bottom of the file
-export function logError(message: { message: string; error: unknown; context: unknown }) {
-  logger.error(`Error: ${message.message}`, message);
+export function logError(logDetails: { message: string; error: unknown; context: unknown }) {
+  const errorMessage =
+    logDetails.error instanceof Error ? logDetails.error.message : String(logDetails.error);
+  logger.error(`${logDetails.message} - Details: ${errorMessage}`, { context: logDetails.context });
 }
 
 export function capitalizeFirstLetter(str: string): string {

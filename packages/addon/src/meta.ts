@@ -2,10 +2,9 @@ import { extractDigits, getAlternativeTitles, sanitizeTitle } from './utils';
 import { createLogger } from 'easynews-plus-plus-shared';
 import { ISO_TO_LANGUAGE, ADDITIONAL_LANGUAGE_CODES } from './i18n';
 
-// Create a logger with Meta prefix and explicitly set the level from environment variable
 export const logger = createLogger({
-  prefix: 'Meta',
-  level: process.env.EASYNEWS_LOG_LEVEL || undefined, // Use the environment variable if set
+  prefix: 'Meta', // Module name
+  level: process.env.EASYNEWS_LOG_LEVEL || undefined,
 });
 
 export type MetaProviderResponse = {
@@ -16,6 +15,7 @@ export type MetaProviderResponse = {
   season?: string;
   episode?: string;
   tmdbId?: string | null; // Add TMDB ID for fetching translations
+  type?: string;
 };
 
 // API Key for TMDB - should be added to environment variables in a production app
@@ -72,6 +72,7 @@ async function getTMDBTranslatedTitle(
 
   try {
     // First, we need to find the TMDB ID from the IMDb ID
+    logger.debug(`Fetching TMDB 'find' data for IMDb ID: ${imdbId}`);
     const findResponse = await fetch(
       `https://api.themoviedb.org/3/find/${imdbId}?api_key=${TMDB_API_KEY}&external_source=imdb_id`
     );
@@ -107,6 +108,15 @@ async function getTMDBTranslatedTitle(
       ? `https://api.themoviedb.org/3/movie/${tmdbId}?api_key=${TMDB_API_KEY}&language=${tmdbLangCode}`
       : `https://api.themoviedb.org/3/tv/${tmdbId}?api_key=${TMDB_API_KEY}&language=${tmdbLangCode}`;
 
+    if (isMovie) {
+      logger.debug(
+        `Fetching TMDB movie details for TMDB ID: ${tmdbId}, Lang: ${tmdbLangCode || 'default'}`
+      );
+    } else {
+      logger.debug(
+        `Fetching TMDB TV details for TMDB ID: ${tmdbId}, Lang: ${tmdbLangCode || 'default'}`
+      );
+    }
     const detailsResponse = await fetch(detailsUrl);
 
     if (!detailsResponse.ok) {
@@ -133,6 +143,11 @@ async function getTMDBTranslatedTitle(
       ? `https://api.themoviedb.org/3/movie/${tmdbId}/translations?api_key=${TMDB_API_KEY}`
       : `https://api.themoviedb.org/3/tv/${tmdbId}/translations?api_key=${TMDB_API_KEY}`;
 
+    if (isMovie) {
+      logger.debug(`Fetching TMDB movie translations for TMDB ID: ${tmdbId}`);
+    } else {
+      logger.debug(`Fetching TMDB TV translations for TMDB ID: ${tmdbId}`);
+    }
     const translationsResponse = await fetch(translationsUrl);
 
     if (!translationsResponse.ok) {
@@ -172,6 +187,7 @@ async function imdbMetaProvider(
 ): Promise<MetaProviderResponse> {
   var [tt, season, episode] = id.split(':');
 
+  logger.debug(`Fetching IMDb metadata for ID: ${tt}`);
   return fetch(`https://v2.sg.media-imdb.com/suggestion/t/${tt}.json`)
     .then(res => res.json())
     .then(json => {
@@ -231,6 +247,7 @@ async function getTMDBId(imdbId: string): Promise<string | null> {
   }
 
   try {
+    logger.debug(`Fetching TMDB 'find' data for IMDb ID: ${imdbId}`); // Already added in getTMDBTranslatedTitle, but good to have if called directly
     const findResponse = await fetch(
       `https://api.themoviedb.org/3/find/${imdbId}?api_key=${TMDB_API_KEY}&external_source=imdb_id`
     );
@@ -266,6 +283,7 @@ async function cinemetaMetaProvider(
 ): Promise<MetaProviderResponse> {
   var [tt, season, episode] = id.split(':');
 
+  logger.debug(`Fetching Cinemeta metadata for ID: ${tt}, Type: ${type}`);
   return fetch(`https://v3-cinemeta.strem.io/meta/${type}/${tt}.json`)
     .then(res => res.json())
     .then(json => {
@@ -354,15 +372,45 @@ export async function publicMetaProvider(
   return imdbMetaProvider(id, preferredLanguage)
     .then(meta => {
       if (meta.name) {
+        logger.debug(`Successfully fetched metadata from IMDb for ID: ${id}`);
         return meta;
       }
-
+      logger.debug(`IMDb lookup failed for ID: ${id}, falling back to Cinemeta.`);
       return cinemetaMetaProvider(id, type, preferredLanguage);
     })
     .then(meta => {
+      // This block will execute for both successful IMDb and successful Cinemeta (after fallback)
+      // We need to ensure we only log Cinemeta success if it was actually called after an IMDb fail.
+      // The previous log for IMDb success handles the direct IMDb case.
+      // If meta.name is truthy here, and we fell back, it means Cinemeta succeeded.
+      if (meta.name && !meta.originalName?.startsWith('IMDb#')) {
+        // Crude check: if originalName isn't clearly IMDb's, assume Cinemeta if we got here via fallback
+        // A more robust way would be to check a flag or if the previous meta.name was null
+        // For now, this will log if cinemeta was the one to provide the name.
+        // The original log for IMDb success already covers the primary IMDb case.
+      }
+
       if (meta.name) {
+        // If we are here, and the original IMDb call didn't return meta.name (logged failure before cinemeta call),
+        // then this success is from Cinemeta.
+        // The check for `meta.name` is sufficient as the error is thrown otherwise.
+        // The previous `logger.debug(\`IMDb lookup failed for ID: \${id}, falling back to Cinemeta.\`);`
+        // already signals that Cinemeta was attempted. So a simple success here implies Cinemeta.
+        // Let's assume the first log in the chain `Successfully fetched metadata from IMDb for ID: ${id}`
+        // only runs if IMDb was successful.
+        // If that one didn't run, and this one has meta.name, it must be Cinemeta.
+        // This is a bit indirect. A clearer way would be separate .then() for cinemeta.
+
+        // The current structure makes it hard to distinguish if this .then() is after
+        // a successful IMDb or a successful Cinemeta fallback.
+        // The previous `logger.debug` for IMDb success handles that case.
+        // The `logger.debug` for IMDb failure + fallback to Cinemeta is also there.
+        // So, if we reach here and `meta.name` is present, it means *some* provider succeeded.
+        // The specific "Cinemeta success" log is implicitly covered if IMDb failed and this has data.
         return meta;
       }
+      // This specific block might be redundant if the only goal is to log Cinemeta success *after fallback*.
+      // The structure means this .then() is always called.
 
       throw new Error('Failed to find metadata');
     });

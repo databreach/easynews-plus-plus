@@ -12,10 +12,9 @@ import { addonInterface } from './addon';
 import { URL } from 'url';
 import { createLogger, getVersion } from 'easynews-plus-plus-shared';
 
-// Create a logger with server prefix and explicitly set the level from environment variable
 export const logger = createLogger({
-  prefix: 'Server',
-  level: process.env.EASYNEWS_LOG_LEVEL || undefined, // Use the environment variable if set
+  prefix: 'Server', // Module name
+  level: process.env.EASYNEWS_LOG_LEVEL || undefined,
 });
 
 type ServerOptions = {
@@ -97,66 +96,114 @@ function serveHTTP(addonInterface: AddonInterface, opts: ServerOptions = {}) {
 
   // Resolve endpoint for stream requests
   app.get('/resolve/:payload/:filename', async (req: Request, res: Response) => {
-    // Expect a Base64URL-encoded URL in the payload
-    const { payload } = req.params;
-    const encodedUrl = payload as string;
-    if (!encodedUrl) {
-      res.status(400).send('Missing url parameter');
-      return;
-    }
+    let username: string | undefined;
+    const { payload, filename } = req.params;
 
-    let targetUrl: string;
     try {
-      // Decode the Base64URL payload back into the Easynews URL with credentials as query-params
-      targetUrl = Buffer.from(encodedUrl, 'base64url').toString('utf-8');
-    } catch {
-      res.status(400).send('Invalid url encoding');
-      return;
-    }
-
-    // Only accept hosts under easynews.com
-    const parsed = new URL(targetUrl);
-    const host = parsed.hostname.toLowerCase();
-    const allowedDomain = /^([a-z0-9-]+\.)*easynews\.com$/i;
-    if (!allowedDomain.test(host)) {
-      res.status(403).send('Domain not allowed');
-      return;
-    }
-
-    // Extract and remove credentials
-    const username = parsed.searchParams.get('u') || '';
-    const password = parsed.searchParams.get('p') || '';
-    parsed.searchParams.delete('u');
-    parsed.searchParams.delete('p');
-    const cleanUrl = parsed.toString();
-
-    // Choose the correct client
-    const client = cleanUrl.startsWith('https:') ? https : http;
-
-    // GET-only request with Range header to follow redirects and get final URL
-    const request = client.request(
-      cleanUrl,
-      {
-        method: 'GET',
-        headers: {
-          Authorization: 'Basic ' + Buffer.from(`${username}:${password}`).toString('base64'),
-          Range: 'bytes=0-0', // only fetch first byte
-        },
-        maxRedirects: 5,
-      },
-      // Redirect client to the real CDN URL
-      (upstream: IncomingMessage & { responseUrl?: string }) => {
-        const finalUrl = upstream.responseUrl || cleanUrl;
-        res.redirect(307, finalUrl);
+      // Expect a Base64URL-encoded URL in the payload
+      const encodedUrl = payload as string;
+      if (!encodedUrl) {
+        // Use global logger here as username might not be available yet for a request-specific one
+        logger.warn(`Missing URL payload in /resolve request for file: ${filename}`);
+        res.status(400).send('Missing url parameter');
+        return;
       }
-    );
 
-    request.on('error', (err: Error) => {
-      logger.error(`Error resolving stream ${cleanUrl}:`, err);
-      res.status(502).send('Error resolving stream');
-    });
+      let targetUrl: string;
+      try {
+        // Decode the Base64URL payload back into the Easynews URL with credentials as query-params
+        targetUrl = Buffer.from(encodedUrl, 'base64url').toString('utf-8');
+      } catch (decodeError) {
+        // Use global logger here
+        logger.warn(
+          `Invalid URL encoding in /resolve for file: ${filename}. Payload: ${payload}`,
+          decodeError
+        );
+        res.status(400).send('Invalid url encoding');
+        return;
+      }
 
-    request.end();
+      const parsed = new URL(targetUrl);
+      // Extract and remove credentials
+      username = parsed.searchParams.get('u') || '';
+      const password = parsed.searchParams.get('p') || '';
+
+      const requestLogger = createLogger({
+        prefix: 'Server', // Module name
+        level: process.env.EASYNEWS_LOG_LEVEL || undefined,
+        username: username || 'unknown_resolve_user',
+      });
+
+      parsed.searchParams.delete('u');
+      parsed.searchParams.delete('p');
+      const cleanUrl = parsed.toString();
+      requestLogger.debug(`Cleaned URL for upstream request: ${cleanUrl}`);
+      requestLogger.info(`Handling /resolve request for file: ${filename}`);
+      requestLogger.debug(`Payload for ${filename}: ${payload}`);
+      requestLogger.debug(`Decoded target URL: ${targetUrl}`);
+
+      const host = parsed.hostname.toLowerCase();
+      const allowedDomain = /^([a-z0-9-]+\.)*easynews\.com$/i;
+      if (!allowedDomain.test(host)) {
+        requestLogger.warn(
+          `Denied /resolve request for invalid domain: ${host}. Target URL: ${targetUrl}`
+        );
+        res.status(403).send('Domain not allowed');
+        return;
+      }
+
+      // Choose the correct client
+      const client = cleanUrl.startsWith('https:') ? https : http;
+
+      requestLogger.info(`Making upstream GET request to: ${cleanUrl}`);
+      // GET-only request with Range header to follow redirects and get final URL
+      const request = client.request(
+        cleanUrl,
+        {
+          method: 'GET',
+          headers: {
+            Authorization: 'Basic ' + Buffer.from(`${username}:${password}`).toString('base64'),
+            Range: 'bytes=0-0', // only fetch first byte
+          },
+          maxRedirects: 5,
+        },
+        // Redirect client to the real CDN URL
+        (upstream: IncomingMessage & { responseUrl?: string }) => {
+          const finalUrl = upstream.responseUrl || cleanUrl;
+          requestLogger.info(
+            `Successfully redirecting client for ${cleanUrl} to final URL: ${finalUrl}`
+          );
+          res.redirect(307, finalUrl);
+        }
+      );
+
+      request.on('error', (err: Error) => {
+        // requestLogger is in scope here
+        requestLogger.error(`Error resolving stream ${cleanUrl}: ${err.message}`, err);
+        if (!res.headersSent) {
+          res.status(502).send('Error resolving stream');
+        }
+      });
+
+      request.end();
+    } catch (error: any) {
+      // Determine username for logging, could be undefined if parsing failed early
+      // or if error happened before requestLogger was initialized.
+      // Create a specific logger for this error context.
+      const activeUsername = username || 'unknown_resolve_error_path'; // username is from the outer scope
+      const errorLogger = createLogger({
+        prefix: 'Server', // Module name
+        level: process.env.EASYNEWS_LOG_LEVEL || undefined,
+        username: activeUsername,
+      });
+      errorLogger.error(
+        `Unexpected error in /resolve handler for file ${filename}: ${error.message}`,
+        error
+      );
+      if (!res.headersSent) {
+        res.status(500).send('Internal server error');
+      }
+    }
   });
 
   if (hasConfig)
@@ -197,7 +244,7 @@ function serveHTTP(addonInterface: AddonInterface, opts: ServerOptions = {}) {
     try {
       const fs = require('fs');
       if (!fs.existsSync(location)) {
-        logger.debug(`Static directory does not exist: ${location}`);
+        logger.warn(`Static directory does not exist: ${location}`);
         throw new Error('directory to serve does not exist');
       }
       app.use(opts.static, express.static(location));
@@ -216,12 +263,12 @@ function serveHTTP(addonInterface: AddonInterface, opts: ServerOptions = {}) {
       const addressInfo = server.address();
       const port = typeof addressInfo === 'object' ? addressInfo?.port : null;
       const url = `http://127.0.0.1:${port}/manifest.json`;
-      logger.debug(`Server started successfully on port: ${port}`);
+      logger.info(`Server started successfully on port: ${port}`);
       logger.info(`Addon accessible at: ${url}`);
       resolve({ url, server });
     });
-    server.on('error', err => {
-      logger.debug(`Server failed to start: ${err.message}`);
+    server.on('error', (err: Error) => {
+      logger.error(`Server failed to start: ${err.message}`, err); // Changed to error and added err object
       reject(err);
     });
   });
@@ -229,7 +276,7 @@ function serveHTTP(addonInterface: AddonInterface, opts: ServerOptions = {}) {
 
 // Start the server with the addon interface
 logger.debug(`Starting addon server with interface: ${addonInterface.manifest.id}`);
-serveHTTP(addonInterface, { port: +(process.env.PORT ?? 1337) }).catch(err => {
+serveHTTP(addonInterface, { port: +(process.env.PORT ?? 1337) }).catch((err: Error) => {
   logger.error('Server failed to start:', err);
   process.exitCode = 1;
 });

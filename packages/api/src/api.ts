@@ -1,14 +1,9 @@
 import { EasynewsSearchResponse, FileData, SearchOptions } from './types';
 import { createBasic } from './utils';
-import { createLogger } from 'easynews-plus-plus-shared';
-
-// Create a logger with API prefix and explicitly set the level from environment variable
-export const logger = createLogger({
-  prefix: 'API',
-  level: process.env.EASYNEWS_LOG_LEVEL || undefined, // Use the environment variable if set
-});
+import { createLogger, Logger } from 'easynews-plus-plus-shared';
 
 export class EasynewsAPI {
+  private readonly logger: Logger;
   private readonly baseUrl = 'https://members.easynews.com';
   private readonly username: string;
   private readonly password: string;
@@ -22,6 +17,11 @@ export class EasynewsAPI {
 
     this.username = options.username;
     this.password = options.password;
+    this.logger = createLogger({
+      prefix: 'API',
+      level: process.env.EASYNEWS_LOG_LEVEL || undefined,
+      username: this.username,
+    });
   }
 
   private getCacheKey(options: SearchOptions): string {
@@ -41,23 +41,23 @@ export class EasynewsAPI {
   private getFromCache(cacheKey: string): EasynewsSearchResponse | null {
     const cached = this.cache.get(cacheKey);
     if (!cached) {
-      logger.debug(`Cache miss for key: ${cacheKey.substring(0, 50)}...`);
+      this.logger.debug(`Cache miss for key: ${cacheKey.substring(0, 50)}...`);
       return null;
     }
 
     const now = Date.now();
     if (now - cached.timestamp > this.cacheTTL) {
-      logger.debug(`Cache expired for key: ${cacheKey.substring(0, 50)}...`);
+      this.logger.debug(`Cache expired for key: ${cacheKey.substring(0, 50)}...`);
       this.cache.delete(cacheKey);
       return null;
     }
 
-    logger.debug(`Cache hit for key: ${cacheKey.substring(0, 50)}...`);
+    this.logger.debug(`Cache hit for key: ${cacheKey.substring(0, 50)}...`);
     return cached.data;
   }
 
   private setCache(cacheKey: string, data: EasynewsSearchResponse): void {
-    logger.debug(
+    this.logger.debug(
       `Caching ${data.data?.length || 0} results for key: ${cacheKey.substring(0, 50)}...`
     );
     this.cache.set(cacheKey, { data, timestamp: Date.now() });
@@ -78,7 +78,7 @@ export class EasynewsAPI {
       throw new Error('Query parameter is required');
     }
 
-    logger.debug(`Searching for: "${query}" (page ${pageNr}, max ${maxResults})`);
+    this.logger.debug(`Searching for: "${query}" (page ${pageNr}, max ${maxResults})`);
 
     const cacheKey = this.getCacheKey({
       query,
@@ -121,7 +121,7 @@ export class EasynewsAPI {
     const url = new URL(`${this.baseUrl}/2.0/search/solr-search/advanced`);
     url.search = new URLSearchParams(searchParams).toString();
 
-    logger.debug(`Request URL: ${url.toString().substring(0, 100)}...`);
+    this.logger.debug(`Request URL: ${url.toString().substring(0, 100)}...`);
 
     try {
       const res = await fetch(url, {
@@ -132,37 +132,41 @@ export class EasynewsAPI {
       });
 
       if (res.status === 401) {
-        logger.debug(`Authentication failed for user: ${this.username}`);
+        this.logger.warn(`Authentication failed for user: ${this.username}`);
         throw new Error('Authentication failed: Invalid username or password');
       }
 
       if (!res.ok) {
-        logger.debug(`Request failed with status: ${res.status} ${res.statusText}`);
+        this.logger.warn(
+          `Request failed with status: ${res.status} ${res.statusText} for query: "${query}"`
+        );
         throw new Error(
           `Failed to fetch search results of query '${query}': ${res.status} ${res.statusText}`
         );
       }
 
       const json = await res.json();
-      logger.debug(`Received ${json.data?.length || 0} results out of ${json.results || 0} total`);
+      this.logger.debug(
+        `Received ${json.data?.length || 0} results out of ${json.results || 0} total for query: "${query}"`
+      );
       this.setCache(cacheKey, json);
       return json;
     } catch (error) {
       if (error instanceof Error) {
         if (error.name === 'AbortError') {
-          logger.debug(`Search request timed out for: "${query}"`);
+          this.logger.warn(`Search request timed out for: "${query}"`);
           throw new Error(`Search request for '${query}' timed out after 20 seconds`);
         }
-        logger.debug(`Error during search: ${error.message}`);
+        this.logger.warn(`Error during search for "${query}": ${error.message}`);
         throw error;
       }
-      logger.debug(`Unknown error during search`);
+      this.logger.error(`Unknown error during search for "${query}"`);
       throw new Error(`Unknown error during search for '${query}'`);
     }
   }
 
   async searchAll(options: SearchOptions): Promise<EasynewsSearchResponse> {
-    logger.debug(`Starting searchAll for: "${options.query}"`);
+    this.logger.info(`Starting searchAll for: "${options.query}"`);
 
     const data: FileData[] = [];
     let res: Partial<EasynewsSearchResponse> = {
@@ -177,8 +181,8 @@ export class EasynewsAPI {
     const MAX_PAGES = parseInt(process.env.MAX_PAGES || '10'); // Safety limit on number of page requests
     const MAX_RESULTS_PER_PAGE = parseInt(process.env.MAX_RESULTS_PER_PAGE || '250'); // Maximum results per page
 
-    logger.info(
-      `Search limits: max ${TOTAL_MAX_RESULTS} results, max ${MAX_PAGES} pages, ${MAX_RESULTS_PER_PAGE} per page`
+    this.logger.info(
+      `Search limits: max ${TOTAL_MAX_RESULTS} results, max ${MAX_PAGES} pages, ${MAX_RESULTS_PER_PAGE} per page for query: "${options.query}"`
     );
 
     let pageNr = 1;
@@ -193,11 +197,15 @@ export class EasynewsAPI {
 
         // If we've already reached our limit, stop fetching
         if (remainingResults <= 0) {
-          logger.debug(`Reached result limit (${TOTAL_MAX_RESULTS}), stopping pagination`);
+          this.logger.debug(
+            `Reached result limit (${TOTAL_MAX_RESULTS}), stopping pagination for query: "${options.query}"`
+          );
           break;
         }
 
-        logger.debug(`Fetching page ${pageNr} with ${optimalPageSize} results per page`);
+        this.logger.debug(
+          `Fetching page ${pageNr} with ${optimalPageSize} results per page for query: "${options.query}"`
+        );
         const pageResult = await this.search({
           ...options,
           pageNr,
@@ -211,29 +219,37 @@ export class EasynewsAPI {
 
         // No more results
         if (newData.length === 0) {
-          logger.debug(`No more results found, stopping pagination`);
+          this.logger.info(
+            `No more results found, stopping pagination for query: "${options.query}" (page ${pageNr})`
+          );
           break;
         }
 
         // Duplicate detection - stop if first item of new page matches first item of previously fetched data
         if (data.length > 0 && newData[0]?.['0'] === data[0]?.['0']) {
-          logger.debug(`Duplicate results detected, stopping pagination`);
+          this.logger.info(
+            `Duplicate results detected, stopping pagination for query: "${options.query}" (page ${pageNr})`
+          );
           break;
         }
 
-        logger.debug(`Adding ${newData.length} results from page ${pageNr}`);
+        this.logger.debug(
+          `Adding ${newData.length} results from page ${pageNr} for query: "${options.query}"`
+        );
         data.push(...newData);
 
         // Stop if we've reached our total limit
         if (data.length >= TOTAL_MAX_RESULTS) {
-          logger.debug(`Reached result limit (${TOTAL_MAX_RESULTS}), trimming and stopping`);
+          this.logger.info(
+            `Reached result limit (${TOTAL_MAX_RESULTS}), trimming and stopping for query: "${options.query}"`
+          );
           // Trim the array to exactly TOTAL_MAX_RESULTS
           data.length = TOTAL_MAX_RESULTS;
           break;
         }
 
-        logger.debug(
-          `Progress: ${data.length}/${TOTAL_MAX_RESULTS} results (${Math.round(
+        this.logger.debug(
+          `Progress for "${options.query}": ${data.length}/${TOTAL_MAX_RESULTS} results (${Math.round(
             (data.length / TOTAL_MAX_RESULTS) * 100
           )}%)`
         );
@@ -241,16 +257,21 @@ export class EasynewsAPI {
         pageNr++;
       }
 
-      logger.debug(`SearchAll complete, returning ${data.length} total results`);
+      this.logger.info(
+        `SearchAll complete for "${options.query}", returning ${data.length} total results`
+      );
       return { ...res, data } as EasynewsSearchResponse;
     } catch (error) {
       // If we have partial results, return them
       if (data.length > 0) {
-        logger.debug(`Returning ${data.length} partial results due to error`);
-        logger.error(`Search error: ${(error as Error).message}`);
+        this.logger.warn(
+          `Returning ${data.length} partial results for query "${options.query}" due to error: ${(error as Error).message}`
+        );
         return { ...res, data } as EasynewsSearchResponse;
       }
-      logger.debug(`No results to return due to error: ${(error as Error).message}`);
+      this.logger.error(
+        `No results to return for query "${options.query}" due to error: ${(error as Error).message}`
+      );
       throw error;
     }
   }
