@@ -5,8 +5,11 @@ import {
   ClientLogger,
   CloudflareLogger,
   SummaryLogger,
-  Logger as InternalLoggerInterface,
+  // Logger as InternalLoggerInterface, // Not directly used for instanceof in new tests
 } from '../src/logger';
+
+// Mock fetch globally for Discord tests
+global.fetch = vi.fn();
 
 const mockWinstonInstance = {
   error: vi.fn(),
@@ -237,6 +240,274 @@ describe('createLogger Factory', () => {
 
     const winstonOptions = winstonSpy.mock.calls[1][0];
     expect(winstonOptions.format).toBeDefined();
+  });
+});
+
+// --- Discord Integration Tests ---
+describe('Logger with Discord Integration', () => {
+  let originalProcessEnv: NodeJS.ProcessEnv;
+  let mockConsoleError: ReturnType<typeof vi.spyOn>;
+  let createLoggerModule: typeof import('../src/logger');
+
+  beforeEach(async () => {
+    // Backup and clear process.env
+    originalProcessEnv = { ...process.env };
+    // Clear specific Discord vars, but keep others from originalEnv for realistic testing
+    delete process.env.DISCORD_WEBHOOK_URL;
+    delete process.env.DISCORD_BOT_NAME;
+    delete process.env.DISCORD_BOT_AVATAR;
+    delete process.env.DISCORD_LOG_LEVEL;
+
+    // Reset mocks
+    (global.fetch as ReturnType<typeof vi.fn>).mockReset();
+
+    // Mock console.error specifically for this suite
+    mockConsoleError = vi.spyOn(console, 'error').mockImplementation(() => {});
+
+    // Dynamically import createLogger to get a fresh version with current process.env
+    vi.resetModules(); // Important to re-evaluate logger module with new env
+    createLoggerModule = await import('../src/logger');
+  });
+
+  afterEach(() => {
+    // Restore process.env
+    process.env = originalProcessEnv;
+    // Restore mocks
+    mockConsoleError.mockRestore();
+    vi.resetAllMocks(); // Clean up any other global mocks if necessary, or be more specific
+  });
+
+  it('should not send to Discord if DISCORD_WEBHOOK_URL is not set', async () => {
+    process.env.DISCORD_WEBHOOK_URL = ''; // Explicitly empty
+    const logger = createLoggerModule.createLogger({ level: 'info' });
+    logger.error('Test error');
+    await new Promise(process.nextTick);
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
+  it('should not send to Discord if DISCORD_WEBHOOK_URL is undefined', async () => {
+    // DISCORD_WEBHOOK_URL is already undefined due to beforeEach
+    const logger = createLoggerModule.createLogger({ level: 'info' });
+    logger.error('Test error');
+    await new Promise(process.nextTick);
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
+  it('should send to Discord if webhook URL is set and log level matches (default ERROR for Discord)', async () => {
+    process.env.DISCORD_WEBHOOK_URL = 'https://discord.com/api/webhooks/test/default';
+    (fetch as ReturnType<typeof vi.fn>).mockResolvedValueOnce({ ok: true, text: async () => '' });
+
+    const logger = createLoggerModule.createLogger({ level: 'info' }); // Winston level
+    logger.error('Test error for Discord');
+    await new Promise(process.nextTick);
+
+    expect(fetch).toHaveBeenCalledTimes(1);
+    expect(fetch).toHaveBeenCalledWith(
+      'https://discord.com/api/webhooks/test/default',
+      expect.objectContaining({
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ content: '[ERROR] Test error for Discord' }),
+      })
+    );
+  });
+
+  it('should respect DISCORD_LOG_LEVEL (e.g., INFO)', async () => {
+    process.env.DISCORD_WEBHOOK_URL = 'https://discord.com/api/webhooks/test/info_level';
+    process.env.DISCORD_LOG_LEVEL = 'INFO';
+    (fetch as ReturnType<typeof vi.fn>).mockResolvedValue({ ok: true, text: async () => '' }); // Mock for all calls
+
+    const logger = createLoggerModule.createLogger({ level: 'debug' }); // Winston log level
+    logger.debug('This is a debug message.'); // Should not be sent
+    logger.info('This is an info message.'); // Should be sent
+    logger.warn('This is a warning message.'); // Should be sent
+    logger.error('This is an error message.'); // Should be sent
+
+    await new Promise(process.nextTick);
+    await new Promise(process.nextTick); // Extra ticks if multiple async logs are tightly packed
+    await new Promise(process.nextTick);
+
+    expect(fetch).toHaveBeenCalledTimes(3);
+    expect(fetch).toHaveBeenCalledWith(
+      expect.any(String),
+      expect.objectContaining({
+        body: JSON.stringify({ content: '[INFO] This is an info message.' }),
+      })
+    );
+    expect(fetch).toHaveBeenCalledWith(
+      expect.any(String),
+      expect.objectContaining({
+        body: JSON.stringify({ content: '[WARN] This is a warning message.' }),
+      })
+    );
+    expect(fetch).toHaveBeenCalledWith(
+      expect.any(String),
+      expect.objectContaining({
+        body: JSON.stringify({ content: '[ERROR] This is an error message.' }),
+      })
+    );
+  });
+
+  it('should not send messages below DISCORD_LOG_LEVEL (e.g. WARN)', async () => {
+    process.env.DISCORD_WEBHOOK_URL = 'https://discord.com/api/webhooks/test/warn_level';
+    process.env.DISCORD_LOG_LEVEL = 'WARN';
+    (fetch as ReturnType<typeof vi.fn>).mockResolvedValue({ ok: true, text: async () => '' });
+
+    const logger = createLoggerModule.createLogger({ level: 'debug' });
+    logger.info('This info should not be sent.');
+    logger.debug('This debug should not be sent.');
+    await new Promise(process.nextTick);
+    expect(fetch).not.toHaveBeenCalled();
+
+    logger.warn('This warning should be sent.');
+    await new Promise(process.nextTick);
+    expect(fetch).toHaveBeenCalledTimes(1);
+    expect(fetch).toHaveBeenCalledWith(
+      expect.any(String),
+      expect.objectContaining({
+        body: JSON.stringify({ content: '[WARN] This warning should be sent.' }),
+      })
+    );
+  });
+
+  it('should use customEnv for Cloudflare-like environment and take precedence over process.env', async () => {
+    const customEnv = {
+      DISCORD_WEBHOOK_URL: 'https://discord.com/api/webhooks/custom/custom',
+      DISCORD_LOG_LEVEL: 'WARN',
+      DISCORD_BOT_NAME: 'CustomBot',
+      DISCORD_BOT_AVATAR: 'http://custom.avatar.com/img.png',
+    };
+    // Set process.env values to ensure customEnv takes precedence
+    process.env.DISCORD_WEBHOOK_URL = 'http://global.webhook.com/ignored';
+    process.env.DISCORD_LOG_LEVEL = 'ERROR'; // customEnv is WARN
+    process.env.DISCORD_BOT_NAME = 'GlobalBotIgnored';
+
+    (fetch as ReturnType<typeof vi.fn>).mockResolvedValueOnce({ ok: true, text: async () => '' });
+
+    // Logger's own level must be permissive enough for 'WARN' to be logged by the base logger
+    const logger = createLoggerModule.createLogger({
+      level: 'info',
+      customEnv,
+      isCloudflare: true,
+    });
+
+    logger.info('This info should not be sent to Discord by customEnv (WARN)');
+    await new Promise(process.nextTick);
+    expect(fetch).not.toHaveBeenCalled();
+
+    logger.warn('Warning from custom env');
+    await new Promise(process.nextTick);
+
+    expect(fetch).toHaveBeenCalledTimes(1);
+    expect(fetch).toHaveBeenCalledWith(
+      'https://discord.com/api/webhooks/custom/custom',
+      expect.objectContaining({
+        body: JSON.stringify({
+          content: '[WARN] Warning from custom env',
+          username: 'CustomBot',
+          avatar_url: 'http://custom.avatar.com/img.png',
+        }),
+      })
+    );
+  });
+
+  it('should include bot name and avatar if set in process.env (Node.js logger)', async () => {
+    process.env.DISCORD_WEBHOOK_URL = 'https://discord.com/api/webhooks/test/bot_details';
+    process.env.DISCORD_LOG_LEVEL = 'INFO'; // Discord log level
+    process.env.DISCORD_BOT_NAME = 'TestBotNode';
+    process.env.DISCORD_BOT_AVATAR = 'http://example.com/avatar_node.png';
+    (fetch as ReturnType<typeof vi.fn>).mockResolvedValueOnce({ ok: true, text: async () => '' });
+
+    // createLogger by default (no isCloudflare) creates a Winston-based logger for Node.js
+    const logger = createLoggerModule.createLogger({ level: 'info' }); // Winston log level
+    logger.info('Test with bot details from process.env');
+
+    await new Promise(process.nextTick);
+
+    expect(fetch).toHaveBeenCalledWith(
+      'https://discord.com/api/webhooks/test/bot_details',
+      expect.objectContaining({
+        body: JSON.stringify({
+          content: '[INFO] Test with bot details from process.env',
+          username: 'TestBotNode',
+          avatar_url: 'http://example.com/avatar_node.png',
+        }),
+      })
+    );
+  });
+
+  it('should log to console.error if fetch fails (response not ok)', async () => {
+    process.env.DISCORD_WEBHOOK_URL = 'https://discord.com/api/webhooks/test/fetch_fail';
+    process.env.DISCORD_LOG_LEVEL = 'ERROR';
+    (fetch as ReturnType<typeof vi.fn>).mockResolvedValueOnce({
+      ok: false,
+      status: 500,
+      statusText: 'Server Error',
+      text: async () => 'Discord error body content',
+    });
+
+    const logger = createLoggerModule.createLogger({ level: 'info' });
+    logger.error('Error message that will fail to send');
+
+    await new Promise(process.nextTick);
+
+    expect(mockConsoleError).toHaveBeenCalledWith(
+      '[Logger] Failed to send log to Discord: 500 Server Error',
+      'Discord error body content'
+    );
+  });
+
+  it('should log to console.error if fetch itself throws an error', async () => {
+    process.env.DISCORD_WEBHOOK_URL = 'https://discord.com/api/webhooks/test/fetch_throw';
+    process.env.DISCORD_LOG_LEVEL = 'WARN';
+    const fetchError = new Error('Network connection failed');
+    (fetch as ReturnType<typeof vi.fn>).mockRejectedValueOnce(fetchError);
+
+    const logger = createLoggerModule.createLogger({ level: 'info' });
+    logger.warn('A warning that will fail to send due to network error');
+
+    await new Promise(process.nextTick);
+
+    expect(mockConsoleError).toHaveBeenCalledWith(
+      '[Logger] Error sending log to Discord:',
+      fetchError
+    );
+  });
+
+  it('should handle invalid DISCORD_LOG_LEVEL by defaulting to ERROR and logging a console error', async () => {
+    process.env.DISCORD_WEBHOOK_URL = 'https://discord.com/api/webhooks/test/invalid_level';
+    process.env.DISCORD_LOG_LEVEL = 'INVALID_LEVEL_XYZ'; // Invalid level
+    (fetch as ReturnType<typeof vi.fn>).mockResolvedValue({ ok: true, text: async () => '' });
+
+    const logger = createLoggerModule.createLogger({ level: 'debug' });
+
+    // First call (e.g., logger.info)
+    logger.info('Info message - should not be sent due to invalid level defaulting to ERROR');
+    await new Promise(process.nextTick);
+    expect(fetch).not.toHaveBeenCalled();
+    expect(mockConsoleError).toHaveBeenCalledTimes(1); // Called once so far
+    expect(mockConsoleError).toHaveBeenNthCalledWith(
+      1,
+      '[Logger] Invalid DISCORD_LOG_LEVEL: "INVALID_LEVEL_XYZ". Defaulting to ERROR for filtering.'
+    );
+
+    // Second call (e.g., logger.error)
+    logger.error('Error message - should be sent as default is ERROR');
+    await new Promise(process.nextTick);
+    expect(fetch).toHaveBeenCalledTimes(1); // Fetch is called for this one
+    expect(fetch).toHaveBeenCalledWith(
+      expect.any(String),
+      expect.objectContaining({
+        body: JSON.stringify({
+          content: '[ERROR] Error message - should be sent as default is ERROR',
+        }),
+      })
+    );
+    expect(mockConsoleError).toHaveBeenCalledTimes(2); // Called a second time
+    expect(mockConsoleError).toHaveBeenNthCalledWith(
+      2,
+      '[Logger] Invalid DISCORD_LOG_LEVEL: "INVALID_LEVEL_XYZ". Defaulting to ERROR for filtering.'
+    );
   });
 });
 

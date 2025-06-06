@@ -2,10 +2,23 @@ import { Hono } from 'hono';
 import { getRouter } from 'hono-stremio';
 import { addonInterface, customTemplate } from 'easynews-plus-plus-addon';
 import { getUILanguage } from 'easynews-plus-plus-addon/dist/i18n';
-import { createLogger } from 'easynews-plus-plus-shared';
+import { createLogger, Logger } from 'easynews-plus-plus-shared'; // Import Logger type if needed
 
-// Create a logger with CF prefix for better context and set Cloudflare environment
-const logger = createLogger({ prefix: 'CF', isCloudflare: true });
+// Define an interface for Cloudflare environment variables
+export interface Env {
+  DISCORD_WEBHOOK_URL?: string;
+  DISCORD_BOT_NAME?: string;
+  DISCORD_BOT_AVATAR?: string;
+  DISCORD_LOG_LEVEL?: string;
+  EASYNEWS_LOG_LEVEL?: string; // For existing logger level configuration
+  // Add other bindings like KV, D1, R2, etc., as needed
+  // EXAMPLE_KV_NAMESPACE: KVNamespace;
+}
+
+// Create a global logger. For Discord logs, this will rely on sendToDiscord's default
+// behavior if customEnv is not set (e.g. process.env or no discord logging if URL isn't there)
+// It's initialized outside request context, so direct access to `c.env` for `customEnv` isn't available here.
+const logger: Logger = createLogger({ prefix: 'CF', isCloudflare: true });
 
 // Create the router with the default HTML
 logger.debug('Initializing Cloudflare Worker with addon interface');
@@ -40,12 +53,18 @@ function createManifestWithLanguage(lang: string) {
 }
 
 // Add resolve endpoint for stream requests
-app.get('/resolve/:payload/:filename', async c => {
+app.get('/resolve/:payload/:filename', async (c: any) => {
+  // c's type can be Hono Context if Hono types are fully set up
+  const env = c.env as Env; // Cast c.env to our Env interface for type safety
   const encodedUrl = c.req.param('payload');
   const filename = c.req.param('filename');
   let username: string | null = null; // To be extracted after URL parsing
   let targetUrl: string = ''; // For logging in broader scope if cleanUrl fails
   let cleanUrl: string = ''; // For logging in broader scope
+
+  // Attempt to create a logger with env early, but username might not be available yet.
+  // Global logger 'logger' can be used for very early errors.
+  // Once username is parsed, a more specific logger is created.
 
   try {
     if (!encodedUrl) {
@@ -68,11 +87,12 @@ app.get('/resolve/:payload/:filename', async c => {
     const parsed = new URL(targetUrl);
     username = parsed.searchParams.get('u'); // Extract username for logging
 
-    const requestLogger = createLogger({
+    const requestLogger: Logger = createLogger({
       prefix: 'CF', // Module name
       isCloudflare: true,
-      level: process.env.EASYNEWS_LOG_LEVEL || undefined,
+      level: env.EASYNEWS_LOG_LEVEL || undefined, // Use env for log level
       username: username || 'cf_unknown_user',
+      customEnv: env, // Pass the Cloudflare env object for Discord logging
     });
 
     requestLogger.info(`Handling /resolve for file: ${filename}`);
@@ -116,24 +136,40 @@ app.get('/resolve/:payload/:filename', async c => {
   } catch (err) {
     const logUrl = cleanUrl || targetUrl; // Prefer cleanUrl if available
     // Use requestLogger if available, or create a new one for the catch block if username was determined
-    const loggerForError =
+    const loggerForError: Logger =
       username !== null
         ? createLogger({
-            // Check if username was set (even if empty string)
             prefix: 'CF',
             isCloudflare: true,
-            level: process.env.EASYNEWS_LOG_LEVEL || undefined,
+            level: env.EASYNEWS_LOG_LEVEL || undefined, // Use env for log level
             username: username || 'cf_catch_unknown',
+            customEnv: env, // Pass the Cloudflare env object for Discord logging
           })
-        : logger; // Fallback to global logger if username is still null (very early error)
+        : logger; // Fallback to global logger. It won't have customEnv here.
     loggerForError.error(`Error resolving stream ${logUrl}: ${(err as Error).message}`, err);
+
+    // Example: Test error logging to Discord from CF worker
+    if (filename === 'test-discord-error.mp4') {
+      loggerForError.error('This is a specific test error from Cloudflare worker for Discord!');
+    }
+
     return c.text('Error resolving stream', 502);
   }
 });
 
 // Add the configure route for direct access with language selection
-app.get('/configure', c => {
-  logger.debug(
+app.get('/configure', (c: any) => {
+  // c's type can be Hono Context
+  const env = c.env as Env; // Cast c.env for type safety
+  // Create a logger for this specific request, including customEnv
+  const configureLogger: Logger = createLogger({
+    prefix: 'CF-Configure',
+    isCloudflare: true,
+    level: env.EASYNEWS_LOG_LEVEL || undefined,
+    customEnv: env,
+  });
+
+  configureLogger.debug(
     `Received /configure request. RayID: ${c.req.header('cf-ray')}, User-Agent: ${c.req.header('user-agent')}`
   );
 
@@ -145,7 +181,7 @@ app.get('/configure', c => {
   const lang = c.req.query('lang') || '';
   const uiLanguage = getUILanguage(lang);
 
-  logger.debug(
+  configureLogger.debug(
     `Cloudflare worker: Received request with lang=${lang}, using UI language ${uiLanguage}`
   );
 
@@ -154,40 +190,56 @@ app.get('/configure', c => {
 
   // If a language is specified, create a specialized manifest for that language
   if (lang) {
-    logger.debug(`Creating customized manifest for language: ${lang}`);
-    tempManifest = createManifestWithLanguage(lang);
+    configureLogger.debug(`Creating customized manifest for language: ${lang}`);
+    tempManifest = createManifestWithLanguage(lang); // This function uses global 'logger' internally
   } else {
     // Otherwise, use the default manifest
-    logger.debug('Using default manifest (no language specified)');
+    configureLogger.debug('Using default manifest (no language specified)');
     tempManifest = addonInterface.manifest;
   }
 
   // Generate new HTML with the updated language
-  logger.debug('Generating HTML with localized template');
+  configureLogger.debug('Generating HTML with localized template');
   const localizedHTML = customTemplate(tempManifest);
-  logger.debug(`Generated localized HTML (${localizedHTML.length} bytes)`);
+  configureLogger.debug(`Generated localized HTML (${localizedHTML.length} bytes)`);
   return c.html(localizedHTML);
 });
 
 // If we have a config, add a redirect from the root to configure
 if ((addonInterface.manifest.config || []).length > 0) {
-  logger.debug('Addon has configuration, setting up root redirect');
-  app.get('/', c => {
-    logger.debug(
+  logger.debug('Addon has configuration, setting up root redirect'); // Global logger
+  app.get('/', (c: any) => {
+    // c's type can be Hono Context
+    const env = c.env as Env; // Cast c.env for type safety
+    const rootLogger: Logger = createLogger({
+      prefix: 'CF-Root',
+      isCloudflare: true,
+      level: env.EASYNEWS_LOG_LEVEL || undefined,
+      customEnv: env,
+    });
+    rootLogger.debug(
       `Received / request. RayID: ${c.req.header('cf-ray')}, User-Agent: ${c.req.header('user-agent')}`
     );
 
     // Pass any language parameter to the configure route
     const lang = c.req.query('lang') || '';
     const redirectUrl = lang ? `/configure?lang=${lang}` : '/configure';
-    logger.debug(`Cloudflare worker: Redirecting to ${redirectUrl}`);
+    rootLogger.debug(`Cloudflare worker: Redirecting to ${redirectUrl}`);
     return c.redirect(redirectUrl);
   });
 } else {
-  logger.debug('Addon has no configuration, keeping default root route');
+  logger.debug('Addon has no configuration, keeping default root route'); // Global logger
 }
 
 app.route('/', addonRouter as any);
-logger.info('Router setup complete, Cloudflare Worker initialized');
+logger.info('Router setup complete, Cloudflare Worker initialized'); // Global logger
 
-export default app;
+// Standard Cloudflare Worker export
+export default {
+  fetch: async (request: Request, env: Env, ctx: ExecutionContext): Promise<Response> => {
+    // You can add any pre-processing or global error handling here if needed,
+    // or pass `env` to Hono if Hono's factory supports it (Hono usually gets it from context).
+    // For now, `c.env` inside routes is the primary way to access `env`.
+    return app.fetch(request, env, ctx);
+  },
+};

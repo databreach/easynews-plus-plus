@@ -1,6 +1,98 @@
 // Defer winston import so the module is pulled in **only** when required.
 let winston: typeof import('winston') | undefined;
 
+// Add this function somewhere in the file, e.g., before the logger class or as a private method if refactoring to a class.
+async function sendToDiscord(
+  message: string,
+  level: string,
+  customEnv?: Record<string, any>
+): Promise<void> {
+  const env = customEnv || (typeof process !== 'undefined' ? process.env : {}); // Allow passing custom env for CF workers
+  const webhookUrl = env.DISCORD_WEBHOOK_URL;
+  const botName = env.DISCORD_BOT_NAME;
+  const botAvatar = env.DISCORD_BOT_AVATAR;
+  let discordLogLevelSetting = env.DISCORD_LOG_LEVEL || 'ERROR'; // Default to ERROR
+
+  if (!webhookUrl) {
+    return; // Do nothing if webhook URL is not set
+  }
+
+  // Map string log levels to numerical severity
+  const levelSeverity: { [key: string]: number } = {
+    DEBUG: 0,
+    INFO: 1,
+    WARN: 2,
+    ERROR: 3,
+    SILLY: -1, // SILLY is less important than DEBUG for Discord
+  };
+
+  let configuredLevelSeverity = levelSeverity[discordLogLevelSetting.toUpperCase()];
+
+  // If the configured DISCORD_LOG_LEVEL is invalid, log an error and default to 'ERROR' for filtering.
+  if (configuredLevelSeverity === undefined) {
+    console.error(
+      `[Logger] Invalid DISCORD_LOG_LEVEL: "${discordLogLevelSetting}". Defaulting to ERROR for filtering.`
+    );
+    discordLogLevelSetting = 'ERROR'; // Force to 'ERROR'
+    configuredLevelSeverity = levelSeverity[discordLogLevelSetting.toUpperCase()]; // Re-lookup, will now be valid
+  }
+
+  // Now check the current message's actual log level.
+  const currentLevelSeverity = levelSeverity[level.toUpperCase()];
+  // If the level of the message itself (e.g., logger.customLevel('message')) is invalid, don't send.
+  if (currentLevelSeverity === undefined) {
+    console.error(
+      `[Logger] Invalid log level used in logger call: "${level}". Cannot send to Discord.`
+    );
+    return;
+  }
+
+  // Filter based on severity.
+  if (currentLevelSeverity < configuredLevelSeverity) {
+    return; // Do not send if message level is below configured (potentially defaulted) level
+  }
+
+  const payload: { content: string; username?: string; avatar_url?: string } = {
+    content: `[${level.toUpperCase()}] ${message}`,
+  };
+
+  if (botName) {
+    payload.username = botName;
+  }
+  if (botAvatar) {
+    payload.avatar_url = botAvatar;
+  }
+
+  try {
+    // Use global fetch if available (Node 18+, CF Workers, Browser)
+    const fetchFn = typeof fetch !== 'undefined' ? fetch : undefined;
+
+    if (!fetchFn) {
+      console.error('[Logger] Global fetch is not available. Cannot send log to Discord.');
+      return;
+    }
+
+    const response = await fetchFn(webhookUrl, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify(payload),
+    });
+
+    if (!response.ok) {
+      // Use response.text() in a separate await to ensure it's processed
+      const responseBody = await response.text();
+      console.error(
+        `[Logger] Failed to send log to Discord: ${response.status} ${response.statusText}`,
+        responseBody
+      );
+    }
+  } catch (error) {
+    console.error('[Logger] Error sending log to Discord:', error);
+  }
+}
+
 /**
  * Get the addon version from package.json
  * @returns Version string
@@ -28,15 +120,18 @@ export class CloudflareLogger {
   level: string;
   username?: string | (() => string | undefined);
   moduleName: string;
+  customEnv?: Record<string, any>; // For CFW
 
   constructor(
     level: string = 'info',
     username?: string | (() => string | undefined),
-    moduleName?: string
+    moduleName?: string,
+    customEnv?: Record<string, any> // For CFW
   ) {
     this.level = level.toLowerCase();
     this.username = username;
     this.moduleName = moduleName || 'general';
+    this.customEnv = customEnv; // Store customEnv
   }
 
   public shouldLog(level: string): boolean {
@@ -74,31 +169,41 @@ export class CloudflareLogger {
 
   error(message: string, ...args: any[]): void {
     if (this.shouldLog('error')) {
-      console.error(this.formatMessage('error', message, this.username, ...args));
+      const formattedMessage = this.formatMessage('error', message, this.username, ...args);
+      console.error(formattedMessage);
+      sendToDiscord(message, 'ERROR', this.customEnv).catch(console.error);
     }
   }
 
   warn(message: string, ...args: any[]): void {
     if (this.shouldLog('warn')) {
-      console.warn(this.formatMessage('warn', message, this.username, ...args));
+      const formattedMessage = this.formatMessage('warn', message, this.username, ...args);
+      console.warn(formattedMessage);
+      sendToDiscord(message, 'WARN', this.customEnv).catch(console.error);
     }
   }
 
   info(message: string, ...args: any[]): void {
     if (this.shouldLog('info')) {
-      console.log(this.formatMessage('info', message, this.username, ...args));
+      const formattedMessage = this.formatMessage('info', message, this.username, ...args);
+      console.log(formattedMessage);
+      sendToDiscord(message, 'INFO', this.customEnv).catch(console.error);
     }
   }
 
   debug(message: string, ...args: any[]): void {
     if (this.shouldLog('debug')) {
-      console.log(this.formatMessage('debug', message, this.username, ...args));
+      const formattedMessage = this.formatMessage('debug', message, this.username, ...args);
+      console.log(formattedMessage);
+      sendToDiscord(message, 'DEBUG', this.customEnv).catch(console.error);
     }
   }
 
   silly(message: string, ...args: any[]): void {
     if (this.shouldLog('silly')) {
-      console.log(this.formatMessage('silly', message, this.username, ...args));
+      const formattedMessage = this.formatMessage('silly', message, this.username, ...args);
+      console.log(formattedMessage);
+      sendToDiscord(message, 'SILLY', this.customEnv).catch(console.error);
     }
   }
 }
@@ -360,6 +465,7 @@ export function createLogger(options?: {
   isClient?: boolean;
   level?: string;
   username?: string | (() => string | undefined);
+  customEnv?: Record<string, any>; // For CFW
 }) {
   // Default options
   const opts = {
@@ -397,7 +503,8 @@ export function createLogger(options?: {
 
   // Use simple logger for Cloudflare environment
   if (opts.isCloudflare) {
-    baseLogger = new CloudflareLogger(logLevel, opts.username, opts.prefix);
+    // Pass customEnv if available, for Cloudflare worker
+    baseLogger = new CloudflareLogger(logLevel, opts.username, opts.prefix, opts.customEnv);
   } else {
     // Use Winston for all other environments
     if (!winston) {
@@ -431,6 +538,24 @@ export function createLogger(options?: {
 
           // Strip color codes from info.level before converting to uppercase for consistent format
           const level = info.level.replace(/\[[0-9;]*m/g, '').toUpperCase();
+          const discordLevel = level.toUpperCase(); // e.g. INFO, ERROR
+
+          // Send to Discord from here as we have the formatted message (msg) and level
+          // process.env will be used by sendToDiscord by default here.
+          let messageForDiscord: string;
+          if (msg instanceof Error) {
+            messageForDiscord = msg.stack || msg.message; // Prefer stack if available
+          } else if (typeof msg === 'object' && msg !== null) {
+            // Attempt to stringify, but catch circular references or other errors
+            try {
+              messageForDiscord = JSON.stringify(msg);
+            } catch (e) {
+              messageForDiscord = '[Logger] Failed to stringify object for Discord';
+            }
+          } else {
+            messageForDiscord = String(msg); // Fallback for primitives or other types
+          }
+          sendToDiscord(messageForDiscord, discordLevel).catch(console.error);
 
           return `${level} [v${getVersion()}][${moduleName}][${user}]: ${msg}`;
         })
@@ -440,6 +565,7 @@ export function createLogger(options?: {
   }
 
   // Wrap with summary logger if enabled
+  // The sendToDiscord calls are now in the baseLoggers (CloudflareLogger or Winston)
   return enableSummary ? new SummaryLogger(baseLogger) : baseLogger;
 }
 

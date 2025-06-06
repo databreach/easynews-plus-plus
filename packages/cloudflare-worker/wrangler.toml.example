@@ -23,3 +23,7 @@ TMDB_API_KEY = "" # Add encrypted value to your Cloudflare worker instance
 CHATWOOT_ENABLED = "false"
 CHATWOOT_BASE_URL= ""
 CHATWOOT_WEBSITE_TOKEN = "" # Add encrypted value to your Cloudflare worker instance
+DISCORD_WEBHOOK_URL = ""
+DISCORD_BOT_NAME = ""
+DISCORD_BOT_AVATAR = ""
+DISCORD_LOG_LEVEL = "ERROR"
